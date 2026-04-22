@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -186,6 +187,145 @@ class ExecuteModelState(NamedTuple):
     positions: torch.Tensor
 
 
+class StepRangeTraceProfiler:
+    """Capture a trace and wall-clock durations for a bounded step range."""
+
+    def __init__(self):
+        self.enabled = self._read_bool_env("VLLM_ASCEND_TRACE_STEPS_ENABLE",
+                                           default=False)
+        self.start_step = self._read_int_env("VLLM_ASCEND_TRACE_STEPS_START",
+                                             default=20)
+        self.end_step = self._read_int_env("VLLM_ASCEND_TRACE_STEPS_END",
+                                           default=23)
+        self.trace_dir = os.environ.get("VLLM_ASCEND_TRACE_DIR",
+                                        "./profiler_trace")
+        self.rank = int(os.environ.get("RANK", "0"))
+        self._profiler = None
+        self._is_running = False
+        self._current_step = None
+        self._step_start_time = None
+        self._captured_steps: dict[int, float] = {}
+
+        if self.start_step > self.end_step:
+            logger.warning(
+                "Invalid trace step range: start_step=%s > end_step=%s. "
+                "Step trace profiling is disabled.",
+                self.start_step,
+                self.end_step,
+            )
+            self.enabled = False
+
+    @staticmethod
+    def _read_bool_env(env_name: str, default: bool) -> bool:
+        value = os.environ.get(env_name)
+        if value is None:
+            return default
+        return value.strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _read_int_env(env_name: str, default: int) -> int:
+        value = os.environ.get(env_name)
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning("Invalid integer env %s=%s, fallback to %s.",
+                           env_name, value, default)
+            return default
+
+    def _should_profile(self, step: int) -> bool:
+        return self.enabled and self.start_step <= step <= self.end_step
+
+    def _ensure_profiler(self):
+        if self._profiler is not None:
+            return
+
+        os.makedirs(self.trace_dir, exist_ok=True)
+        trace_dir = os.path.join(self.trace_dir, f"rank_{self.rank}")
+
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            msprof_tx=False,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            l2_cache=False,
+            op_attr=False,
+            data_simplification=False,
+            record_op_args=False,
+            gc_detect_threshold=None,
+        )
+        self._profiler = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            schedule=torch_npu.profiler.schedule(wait=0,
+                                                 warmup=0,
+                                                 active=self.end_step -
+                                                 self.start_step + 1,
+                                                 repeat=1,
+                                                 skip_first=0),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                trace_dir),
+            experimental_config=experimental_config,
+            with_stack=False,
+            profile_memory=False,
+            with_modules=False,
+        )
+
+    def begin_step(self, step: int) -> None:
+        if not self._should_profile(step):
+            return
+
+        self._ensure_profiler()
+
+        if not self._is_running:
+            assert self._profiler is not None
+            logger.info(
+                "Enable torch_npu profiler for step range [%d, %d], trace dir: %s",
+                self.start_step,
+                self.end_step,
+                self.trace_dir,
+            )
+            self._profiler.start()
+            self._is_running = True
+
+        self._current_step = step
+        self._step_start_time = time.perf_counter()
+
+    def end_step(self, step: int) -> None:
+        if not self._should_profile(step):
+            return
+        if self._current_step != step or self._step_start_time is None:
+            return
+
+        torch.npu.synchronize()
+        step_duration_ms = (time.perf_counter() -
+                            self._step_start_time) * 1000.0
+        self._captured_steps[step] = step_duration_ms
+        assert self._profiler is not None
+        self._profiler.step()
+        logger.info("Profile target step %d total latency: %.2f ms", step,
+                    step_duration_ms)
+
+        self._current_step = None
+        self._step_start_time = None
+
+        if step == self.end_step:
+            self._profiler.stop()
+            self._is_running = False
+            logger.info(
+                "torch_npu profiler finished for steps [%d, %d]. "
+                "Per-step latency(ms): %s",
+                self.start_step,
+                self.end_step,
+                ", ".join(
+                    f"{step_id}={latency:.2f}"
+                    for step_id, latency in sorted(self._captured_steps.items())),
+            )
+
+
 class NPUModelRunner(GPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -228,6 +368,8 @@ class NPUModelRunner(GPUModelRunner):
         # use_hybrid_blocks: if hybrid blocks is used.
         self.use_hybrid_blocks: bool = False
         self.need_accepted_tokens: bool = False
+        self.step_counter = 0
+        self.step_trace_profiler = StepRangeTraceProfiler()
 
         self.is_multimodal_model = self.model_config.is_multimodal_model
         self.block_size = vllm_config.cache_config.block_size
@@ -1365,7 +1507,11 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors] | None:
+        self.step_counter += 1
+        current_step = self.step_counter
+        self.step_trace_profiler.begin_step(current_step)
         if self.execute_model_state is not None:
+            self.step_trace_profiler.end_step(current_step)
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
 
@@ -1377,8 +1523,10 @@ class NPUModelRunner(GPUModelRunner):
                         encoder_cache=self.encoder_cache,
                 ):
                     self._execute_mm_encoder(scheduler_output)
-                    return make_empty_encoder_model_runner_output(
+                    output = make_empty_encoder_model_runner_output(
                         scheduler_output)
+                    self.step_trace_profiler.end_step(current_step)
+                    return output
 
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
@@ -1386,9 +1534,12 @@ class NPUModelRunner(GPUModelRunner):
                         "skip this step for we receive the data from remote disaggregate prefill node"
                     )
                     # Return empty ModelRunnerOuptut if there's no work to do.
+                    self.step_trace_profiler.end_step(current_step)
                     return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output,
-                                                    self.vllm_config)
+                output = self.kv_connector_no_forward(scheduler_output,
+                                                      self.vllm_config)
+                self.step_trace_profiler.end_step(current_step)
+                return output
 
             if self.dynamic_eplb:
                 self.eplb_updator.forward_before()
@@ -1414,12 +1565,16 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 self.debugger.start()
 
-        uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
-            scheduler_output.total_num_scheduled_tokens
-            == self.input_batch.num_reqs * max_query_len)
+        uniform_decode = (
+            max_query_len == self.uniform_decode_query_len
+        ) and (scheduler_output.total_num_scheduled_tokens
+                == self.input_batch.num_reqs * max_query_len)
         has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
         aclgraph_runtime_mode, batch_descriptor = \
-            self.cudagraph_dispatcher.dispatch(num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora)
+            self.cudagraph_dispatcher.dispatch(
+                num_tokens=num_input_tokens,
+                uniform_decode=uniform_decode,
+                has_lora=has_lora)
 
         if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
@@ -1474,10 +1629,11 @@ class NPUModelRunner(GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    self.step_trace_profiler.end_step(current_step)
                     return hidden_states
                 assert isinstance(hidden_states, IntermediateTensors)
-                get_pp_group().send_tensor_dict(
-                    hidden_states.tensors, all_gather_group=get_tp_group())
+                get_pp_group().send_tensor_dict(hidden_states.tensors,
+                                                all_gather_group=get_tp_group())
                 logits = None
             else:
                 if self.input_batch.pooling_params:
@@ -1488,6 +1644,7 @@ class NPUModelRunner(GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    self.step_trace_profiler.end_step(current_step)
                     return pool_output
                 # Sometimes, after the model is compiled through the AOT backend,
                 # the model output may become a list containing only one Tensor object.
@@ -1525,20 +1682,24 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        current_step = self.step_counter
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
+                self.step_trace_profiler.end_step(current_step)
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
+                self.step_trace_profiler.end_step(current_step)
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
+            self.step_trace_profiler.end_step(current_step)
             return output
 
         # Unpack ephemeral state.
@@ -1643,13 +1804,14 @@ class NPUModelRunner(GPUModelRunner):
                 assert self.debugger is not None
                 self.debugger.stop()
                 self.debugger.step()
+            self.step_trace_profiler.end_step(current_step)
             return model_runner_output
 
         if self.debugger is not None:
             assert self.debugger is not None
             self.debugger.stop()
             self.debugger.step()
-        return AsyncGPUModelRunnerOutput(
+        output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,
@@ -1657,6 +1819,8 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
         )
+        self.step_trace_profiler.end_step(current_step)
+        return output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
